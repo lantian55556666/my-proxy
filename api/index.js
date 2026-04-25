@@ -1,202 +1,75 @@
-// Replit AI Proxy — 零依赖，Node.js 18+
-// 核心增强：OpenAI <-> Claude Tool Calling 协议转换
-import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
 
-const PORT = process.env.PORT || 3000;
-const KEY_FILE = ".proxy-key";
-let KEY;
-
-if (existsSync(KEY_FILE)) {
-    KEY = readFileSync(KEY_FILE, "utf8").trim();
-} else {
-    KEY = "sk-replit-" + randomBytes(5).toString("hex");
-    writeFileSync(KEY_FILE, KEY);
-}
-
-const creds = (p) => {
-    const P = p.toUpperCase();
-    return {
-        url: process.env[`AI_INTEGRATIONS_${P}_BASE_URL`],
-        key: process.env[`AI_INTEGRATIONS_${P}_API_KEY`]
-    };
-};
-
-const route = (m) => m.startsWith("claude-") ? "anthropic" : m.startsWith("gemini-") ? "gemini" : m.includes("/") ? "openrouter" : "openai";
-
-const readBody = (req) => new Promise((r) => {
-    const c = [];
-    req.on("data", (d) => c.push(d));
-    req.on("end", () => r(Buffer.concat(c).toString()));
-});
-
-const J = (res, s, d) => {
-    res.writeHead(s, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(d));
-};
+// 环境变量配置
+const KEY = process.env.PROXY_KEY || "sk-replit-2528d01b32";
+const ANTHROPIC_KEY = process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY;
+const ANTHROPIC_URL = process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL || "https://api.anthropic.com/v1";
 
 const rid = () => "chatcmpl-" + randomBytes(4).toString("hex");
 const now = () => (Date.now() / 1000) | 0;
 
-// --- 工具函数：协议转换逻辑 ---
+// Vercel 必须导出一个默认函数，不能使用 createServer
+export default async function handler(req, res) {
+    // 1. 跨域处理 (CORS)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+    if (req.method === "OPTIONS") return res.status(204).end();
 
-// OpenAI tools -> Anthropic tools
-function oaiToolsToAnt(tools) {
-    if (!tools) return undefined;
-    return tools.map(t => ({
-        name: t.function.name,
-        description: t.function.description || "",
-        input_schema: t.function.parameters
-    }));
-}
+    // 2. 鉴权
+    if (req.headers.authorization !== `Bearer ${KEY}`) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
 
-// OpenAI messages -> Anthropic messages (处理 tool_use/tool_result)
-function oaiMsgsToAnt(messages) {
-    const antMsgs = [];
-    messages.forEach(m => {
-        if (m.role === "system") return;
+    // 3. Models 接口 (支持 /v1/models 和 /api/models)
+    if (req.url.includes("/models")) {
+        const models = [
+            { id: "gpt-5.5", object: "model", created: now(), owned_by: "openai" },
+            { id: "gpt-5.3-codex", object: "model", created: now(), owned_by: "openai" },
+            { id: "claude-3-5-sonnet-20241022", object: "model", created: now(), owned_by: "anthropic" }
+        ];
+        return res.status(200).json({ object: "list", data: models });
+    }
 
-        if (m.role === "assistant" && m.tool_calls) {
-            const content = [];
-            if (m.content) content.push({ type: "text", text: m.content });
-            m.tool_calls.forEach(tc => {
-                content.push({
-                    type: "tool_use",
-                    id: tc.id,
-                    name: tc.function.name,
-                    input: JSON.parse(tc.function.arguments)
-                });
+    // 4. Chat Completions 接口
+    if (req.method === "POST" && req.url.includes("/chat/completions")) {
+        try {
+            const p = req.body; // Vercel 自动解析 JSON
+            
+            // 简单演示：全部转发给 Anthropic
+            const response = await fetch(`${ANTHROPIC_URL}/messages`, {
+                method: "POST",
+                headers: { 
+                    "Content-Type": "application/json", 
+                    "x-api-key": ANTHROPIC_KEY,
+                    "anthropic-version": "2023-06-01"
+                },
+                body: JSON.stringify({
+                    model: "claude-3-5-sonnet-20241022", // 映射到实际模型
+                    max_tokens: p.max_tokens || 4096,
+                    messages: p.messages.filter(m => m.role !== 'system'),
+                    system: p.messages.find(m => m.role === 'system')?.content
+                }),
             });
-            antMsgs.push({ role: "assistant", content });
-        } else if (m.role === "tool") {
-            antMsgs.push({
-                role: "user",
-                content: [{
-                    type: "tool_result",
-                    tool_use_id: m.tool_call_id,
-                    content: m.content
+
+            const data = await response.json();
+            
+            // 转换为 OpenAI 格式返回
+            return res.status(200).json({
+                id: rid(),
+                object: "chat.completion",
+                created: now(),
+                model: p.model,
+                choices: [{
+                    index: 0,
+                    message: { role: "assistant", content: data.content[0].text },
+                    finish_reason: "stop"
                 }]
             });
-        } else {
-            antMsgs.push({ role: m.role, content: m.content });
-        }
-    });
-    return antMsgs;
-}
-
-// --- 流式响应处理 ---
-
-function oaiChunk(id, model, delta, finish = null) {
-    return JSON.stringify({
-        id, object: "chat.completion.chunk", created: now(), model,
-        choices: [{ index: 0, delta, finish_reason: finish }]
-    });
-}
-
-async function streamAnthropic(reader, res, model) {
-    const dec = new TextDecoder(), id = rid();
-    let buf = "";
-    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop();
-        for (const l of lines) {
-            if (!l.startsWith("data: ")) continue;
-            try {
-                const e = JSON.parse(l.slice(6));
-                // 文本增量
-                if (e.type === "content_block_delta" && e.delta?.text) {
-                    res.write(`data: ${oaiChunk(id, model, { content: e.delta.text })}\n\n`);
-                }
-                // Tool Use 开始 (流式暂不支持复杂转换，返回占位)
-                if (e.type === "content_block_start" && e.content_block?.type === "tool_use") {
-                   // 实际生产环境需处理 tool 增量，此处简化为逻辑标记
-                }
-                if (e.type === "message_stop") res.write(`data: ${oaiChunk(id, model, {}, "stop")}\n\n`);
-            } catch {}
-        }
-    }
-    res.write("data: [DONE]\n\n");
-    res.end();
-}
-
-// --- 主服务器 ---
-
-createServer(async (req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "*");
-    if (req.method === "OPTIONS") return res.writeHead(204).end();
-
-    if (req.headers.authorization !== `Bearer ${KEY}`) return J(res, 401, { error: "Unauthorized" });
-
-    // Models 列表
-    if (req.url === "/v1/models") {
-        const models = [
-            { id: "gpt-5.5", owned_by: "openai" },
-            { id: "gpt-5.3-codex", owned_by: "openai" },
-            { id: "claude-3-5-sonnet-20241022", owned_by: "anthropic" }
-        ];
-        return J(res, 200, { object: "list", data: models.map(m => ({ ...m, object: "model", created: now() })) });
-    }
-
-    if (req.url === "/v1/chat/completions" && req.method === "POST") {
-        const raw = await readBody(req);
-        const p = JSON.parse(raw);
-        const prov = route(p.model);
-        const { url, key } = creds(prov);
-
-        try {
-            if (prov === "anthropic") {
-                const antBody = {
-                    model: p.model,
-                    max_tokens: p.max_tokens || 4096,
-                    system: p.messages.find(m => m.role === "system")?.content,
-                    messages: oaiMsgsToAnt(p.messages),
-                    tools: oaiToolsToAnt(p.tools),
-                    stream: p.stream || false
-                };
-
-                const up = await fetch(`${url}/messages`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-                    body: JSON.stringify(antBody)
-                });
-
-                if (p.stream) return streamAnthropic(up.body.getReader(), res, p.model);
-
-                const d = await up.json();
-                // Anthropic -> OpenAI 转换 (含 tool_use)
-                const tool_calls = d.content.filter(c => c.type === "tool_use").map(tu => ({
-                    id: tu.id, type: "function", function: { name: tu.name, arguments: JSON.stringify(tu.input) }
-                }));
-
-                return J(res, 200, {
-                    id: rid(), object: "chat.completion", created: now(), model: p.model,
-                    choices: [{
-                        index: 0,
-                        message: { 
-                            role: "assistant", 
-                            content: d.content.find(c => c.type === "text")?.text || null,
-                            tool_calls: tool_calls.length > 0 ? tool_calls : undefined
-                        },
-                        finish_reason: d.stop_reason === "tool_use" ? "tool_calls" : "stop"
-                    }],
-                    usage: { prompt_tokens: d.usage.input_tokens, completion_tokens: d.usage.output_tokens, total_tokens: d.usage.input_tokens + d.usage.output_tokens }
-                });
-            }
-
-            // OpenAI / Gemini 默认逻辑 (略，保持与原代码一致)
-            // ...
         } catch (e) {
-            return J(res, 502, { error: { message: e.message } });
+            return res.status(502).json({ error: "Proxy Error: " + e.message });
         }
     }
-    J(res, 404, { error: "Not found" });
-}).listen(PORT, () => {
-    console.log(`Replit AI Proxy 启动。Key: ${KEY}`);
-});
+
+    return res.status(404).json({ error: "Not Found", url: req.url });
+}
