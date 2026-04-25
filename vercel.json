@@ -1,5 +1,6 @@
 {
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api/index.js" }
+    { "source": "/v1/(.*)", "destination": "/api/index.js" },
+    { "source": "/v1/models", "destination": "/api/index.js" }
   ]
 }
